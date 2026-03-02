@@ -30,12 +30,13 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from collections import defaultdict
+from collections import defaultdict, deque
 from email.utils import parsedate_to_datetime
 from typing import Any
 
 
 DEFAULT_RESPONSE_SYSTEM_PROMPT = "You are a helpful assistant."
+EMPTY_MODEL_RESPONSE_PLACEHOLDER = "[Model returned an empty response.]"
 
 REASONING_EFFORT_ALIASES: dict[str, str] = {
 }
@@ -216,10 +217,12 @@ COLLECT_DEFAULTS: dict[str, Any] = {
     "run_id": "",
     "num_runs": 1,
     "parallelism": 4,
+    "max_inflight_per_model": 0,
     "limit": 0,
     "techniques": "",
     "temperature": None,
     "max_tokens": 0,
+    "empty_response_retries": 2,
     "pause_seconds": 0.0,
     "retries": 3,
     "timeout_seconds": 120,
@@ -231,6 +234,12 @@ COLLECT_DEFAULTS: dict[str, Any] = {
     "store_response_raw": False,
     "shuffle_tasks": False,
     "seed": 42,
+    "rate_limit_requeue": True,
+    "rate_limit_cooldown_seconds": 20.0,
+    "rate_limit_cooldown_max_seconds": 300.0,
+    "rate_limit_cooldown_jitter_seconds": 1.0,
+    "rate_limit_max_attempts": 12,
+    "checkpoint_fsync_every": 20,
     "dry_run": False,
     "resume": False,
     "fail_on_error": True,
@@ -246,6 +255,7 @@ GRADE_DEFAULTS: dict[str, Any] = {
     "judge_temperature": None,
     "judge_reasoning_effort": "off",
     "judge_max_tokens": 0,
+    "judge_output_retries": 2,
     "store_judge_response_raw": False,
     "pause_seconds": 0.0,
     "retries": 3,
@@ -263,6 +273,8 @@ GRADE_PANEL_DEFAULTS: dict[str, Any] = {
     "responses_file": "",
     "judge_models": "",
     "tiebreaker_model": "",
+    "panel_mode": "full",
+    "consensus_method": "mean",
     "output_dir": "",
     "panel_id": "",
     "parallelism": 4,
@@ -270,6 +282,7 @@ GRADE_PANEL_DEFAULTS: dict[str, Any] = {
     "judge_temperature": None,
     "judge_reasoning_effort": "off",
     "judge_max_tokens": 0,
+    "judge_output_retries": 2,
     "store_judge_response_raw": False,
     "pause_seconds": 0.0,
     "retries": 3,
@@ -285,7 +298,7 @@ GRADE_PANEL_DEFAULTS: dict[str, Any] = {
 
 AGGREGATE_DEFAULTS: dict[str, Any] = {
     "grade_dirs": "",
-    "consensus_method": "majority",
+    "consensus_method": "mean",
     "output_dir": "",
     "aggregate_id": "",
     "fail_on_error": True,
@@ -346,13 +359,10 @@ def apply_config_defaults(
         current = getattr(args, key)
         if current == default:
             new_value = section[key]
-            if key == "models" and isinstance(new_value, list):
+            if key in {"models", "grade_dirs", "judge_models"} and isinstance(
+                new_value, list
+            ):
                 setattr(args, key, ",".join(str(x) for x in new_value))
-            elif key == "grade_dirs" and isinstance(new_value, list):
-                setattr(args, key, ",".join(str(x) for x in new_value))
-            elif key == "judge_models" and isinstance(new_value, list):
-                # Not a direct argparse arg, handled in run_grade.
-                continue
             else:
                 setattr(args, key, new_value)
 
@@ -389,11 +399,26 @@ def parse_args() -> argparse.Namespace:
         default=4,
         help="Concurrent OpenRouter calls during collection.",
     )
+    collect.add_argument(
+        "--max-inflight-per-model",
+        type=int,
+        default=0,
+        help="Cap concurrent in-flight requests per model. 0 disables the cap.",
+    )
     collect.add_argument("--limit", type=int, default=0)
     collect.add_argument("--techniques", default="")
     collect.add_argument("--temperature", type=float, default=None)
     collect.add_argument("--max-tokens", type=int, default=0,
                          help="Max response tokens. 0 = no limit (omit from API call).")
+    collect.add_argument(
+        "--empty-response-retries",
+        type=int,
+        default=2,
+        help=(
+            "Additional retries when API returns an empty assistant content string. "
+            "After retries are exhausted, store a placeholder response instead of failing."
+        ),
+    )
     collect.add_argument("--pause-seconds", type=float, default=0.0)
     collect.add_argument(
         "--retries",
@@ -439,6 +464,49 @@ def parse_args() -> argparse.Namespace:
         help="Randomize request order before execution.",
     )
     collect.add_argument("--seed", type=int, default=42)
+    collect.add_argument(
+        "--rate-limit-requeue",
+        dest="rate_limit_requeue",
+        action="store_true",
+        default=True,
+        help="Requeue 429/rate-limited tasks with model cooldown instead of failing immediately (default: enabled).",
+    )
+    collect.add_argument(
+        "--no-rate-limit-requeue",
+        dest="rate_limit_requeue",
+        action="store_false",
+        help="Disable model-aware rate-limit requeue behavior.",
+    )
+    collect.add_argument(
+        "--rate-limit-cooldown-seconds",
+        type=float,
+        default=20.0,
+        help="Base cooldown before retrying a rate-limited model when Retry-After is absent.",
+    )
+    collect.add_argument(
+        "--rate-limit-cooldown-max-seconds",
+        type=float,
+        default=300.0,
+        help="Maximum cooldown cap for rate-limit retries.",
+    )
+    collect.add_argument(
+        "--rate-limit-cooldown-jitter-seconds",
+        type=float,
+        default=1.0,
+        help="Random jitter added to model cooldown to avoid retry bursts.",
+    )
+    collect.add_argument(
+        "--rate-limit-max-attempts",
+        type=int,
+        default=12,
+        help="Max total attempts per sample_id before surfacing a final rate-limit error.",
+    )
+    collect.add_argument(
+        "--checkpoint-fsync-every",
+        type=int,
+        default=20,
+        help="Force fsync on partial progress logs every N finalized rows (0 disables).",
+    )
     collect.add_argument(
         "--dry-run",
         action="store_true",
@@ -501,6 +569,14 @@ def parse_args() -> argparse.Namespace:
         help="Max judge response tokens. 0 = no limit (omit from API call).",
     )
     grade.add_argument(
+        "--judge-output-retries",
+        type=int,
+        default=2,
+        help=(
+            "Additional retries when judge output is empty or fails strict JSON parsing."
+        ),
+    )
+    grade.add_argument(
         "--store-judge-response-raw",
         action="store_true",
         help="Store raw judge provider payload in grades.jsonl (off by default).",
@@ -555,7 +631,9 @@ def parse_args() -> argparse.Namespace:
 
     grade_panel = subparsers.add_parser(
         "grade-panel",
-        help="V2: run two primary judges and optional disagreement-only tiebreaker.",
+        help=(
+            "Run the canonical 3-judge grading panel (full pass, mean aggregation)."
+        ),
     )
     grade_panel.add_argument(
         "--responses-file",
@@ -565,12 +643,30 @@ def parse_args() -> argparse.Namespace:
     grade_panel.add_argument(
         "--judge-models",
         default="",
-        help="Comma-separated primary judge models (usually two).",
+        help="Comma-separated judge models.",
     )
     grade_panel.add_argument(
         "--tiebreaker-model",
         default="",
-        help="Optional tiebreaker judge model for disagreement rows only.",
+        help=(
+            "Deprecated legacy option. Leave empty; canonical panel mode does not use a tiebreaker."
+        ),
+    )
+    grade_panel.add_argument(
+        "--panel-mode",
+        choices=["full", "auto"],
+        default="full",
+        help=(
+            "Panel execution mode. Use full for canonical execution; auto is accepted as a legacy alias of full."
+        ),
+    )
+    grade_panel.add_argument(
+        "--consensus-method",
+        choices=["auto", "mean"],
+        default="mean",
+        help=(
+            "Aggregate scoring method. Use mean for canonical execution; auto is accepted as a legacy alias of mean."
+        ),
     )
     grade_panel.add_argument("--config", default="config.json")
     grade_panel.add_argument("--output-dir", default="")
@@ -610,6 +706,14 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Max judge response tokens. 0 = no limit (omit from API call).",
+    )
+    grade_panel.add_argument(
+        "--judge-output-retries",
+        type=int,
+        default=2,
+        help=(
+            "Additional retries when judge output is empty or fails strict JSON parsing."
+        ),
     )
     grade_panel.add_argument(
         "--store-judge-response-raw",
@@ -670,7 +774,7 @@ def parse_args() -> argparse.Namespace:
     aggregate.add_argument(
         "--consensus-method",
         choices=["majority", "mean", "min", "max", "primary_tiebreak"],
-        default="majority",
+        default="mean",
     )
     aggregate.add_argument("--output-dir", default="")
     aggregate.add_argument("--aggregate-id", default="")
@@ -708,6 +812,17 @@ def split_csv(value: str) -> list[str]:
     if not value.strip():
         return []
     return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def dedupe_preserve_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
 
 
 def normalize_reasoning_effort(value: Any, *, field_name: str) -> str | None:
@@ -1174,6 +1289,334 @@ def append_jsonl(path: pathlib.Path, row: dict[str, Any]) -> None:
         handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+class JsonlAppender:
+    def __init__(self, path: pathlib.Path, *, fsync_every: int = 0) -> None:
+        self.path = path
+        self.fsync_every = max(0, int(fsync_every))
+        self._writes_since_sync = 0
+        self._handle = path.open("a", encoding="utf-8", buffering=1)
+
+    def append(self, row: dict[str, Any]) -> None:
+        self._handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        if self.fsync_every <= 0:
+            return
+        self._writes_since_sync += 1
+        if self._writes_since_sync >= self.fsync_every:
+            self.sync()
+
+    def sync(self) -> None:
+        self._handle.flush()
+        os.fsync(self._handle.fileno())
+        self._writes_since_sync = 0
+
+    def close(self) -> None:
+        if self._handle.closed:
+            return
+        self._handle.flush()
+        if self.fsync_every > 0:
+            os.fsync(self._handle.fileno())
+        self._handle.close()
+
+    def __enter__(self) -> "JsonlAppender":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:  # type: ignore[override]
+        self.close()
+
+
+def _coerce_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if value.is_integer():
+            return int(value)
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            parsed = float(text)
+        except ValueError:
+            return None
+        if parsed.is_integer():
+            return int(parsed)
+    return None
+
+
+def _coerce_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            return None
+    return None
+
+
+def _coerce_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"true", "1", "yes"}:
+            return True
+        if text in {"false", "0", "no"}:
+            return False
+    return None
+
+
+def extract_response_usage_metrics(usage: Any) -> dict[str, Any]:
+    usage_obj = usage if isinstance(usage, dict) else {}
+    prompt_details = (
+        usage_obj.get("prompt_tokens_details")
+        if isinstance(usage_obj.get("prompt_tokens_details"), dict)
+        else {}
+    )
+    completion_details = (
+        usage_obj.get("completion_tokens_details")
+        if isinstance(usage_obj.get("completion_tokens_details"), dict)
+        else {}
+    )
+    cost_details = (
+        usage_obj.get("cost_details")
+        if isinstance(usage_obj.get("cost_details"), dict)
+        else {}
+    )
+    return {
+        "response_prompt_tokens": _coerce_int(usage_obj.get("prompt_tokens")),
+        "response_completion_tokens": _coerce_int(usage_obj.get("completion_tokens")),
+        "response_total_tokens": _coerce_int(usage_obj.get("total_tokens")),
+        "response_reasoning_tokens": _coerce_int(
+            completion_details.get("reasoning_tokens")
+        ),
+        "response_cached_prompt_tokens": _coerce_int(
+            prompt_details.get("cached_tokens")
+        ),
+        "response_cache_write_tokens": _coerce_int(
+            prompt_details.get("cache_write_tokens")
+        ),
+        "response_cost_usd": _coerce_float(usage_obj.get("cost")),
+        "response_upstream_inference_cost_usd": _coerce_float(
+            cost_details.get("upstream_inference_cost")
+        ),
+        "response_upstream_inference_prompt_cost_usd": _coerce_float(
+            cost_details.get("upstream_inference_prompt_cost")
+        ),
+        "response_upstream_inference_completions_cost_usd": _coerce_float(
+            cost_details.get("upstream_inference_completions_cost")
+        ),
+        "response_usage_is_byok": _coerce_bool(usage_obj.get("is_byok")),
+    }
+
+
+def enrich_collect_record_metrics(record: dict[str, Any]) -> dict[str, Any]:
+    usage_metrics = extract_response_usage_metrics(record.get("response_usage", {}))
+    record.update(usage_metrics)
+
+    response_text = record.get("response_text", "")
+    text = response_text if isinstance(response_text, str) else str(response_text or "")
+    record["response_char_count"] = len(text)
+
+    total_tokens = _coerce_int(record.get("response_total_tokens"))
+    latency_ms = _coerce_int(record.get("response_latency_ms"))
+    if total_tokens is not None and latency_ms is not None and latency_ms > 0:
+        record["response_tokens_per_second"] = round(
+            total_tokens / (latency_ms / 1000.0), 4
+        )
+    else:
+        record["response_tokens_per_second"] = None
+    return record
+
+
+def _new_usage_bucket() -> dict[str, Any]:
+    return {
+        "rows": 0,
+        "success_rows": 0,
+        "error_rows": 0,
+        "rows_with_usage": 0,
+        "rows_with_total_tokens": 0,
+        "rows_with_cost": 0,
+        "rows_with_latency": 0,
+        "rows_with_tokens_per_second": 0,
+        "rows_with_byok_true": 0,
+        "prompt_tokens_total": 0,
+        "completion_tokens_total": 0,
+        "total_tokens_total": 0,
+        "reasoning_tokens_total": 0,
+        "cached_prompt_tokens_total": 0,
+        "cache_write_tokens_total": 0,
+        "cost_usd_total": 0.0,
+        "upstream_inference_cost_usd_total": 0.0,
+        "upstream_inference_prompt_cost_usd_total": 0.0,
+        "upstream_inference_completions_cost_usd_total": 0.0,
+        "response_char_count_total": 0,
+        "latency_ms_total": 0,
+        "tokens_per_second_total": 0.0,
+    }
+
+
+def _add_if_int(bucket: dict[str, Any], key: str, value: Any) -> int | None:
+    parsed = _coerce_int(value)
+    if parsed is not None:
+        bucket[key] += parsed
+    return parsed
+
+
+def _add_if_float(bucket: dict[str, Any], key: str, value: Any) -> float | None:
+    parsed = _coerce_float(value)
+    if parsed is not None:
+        bucket[key] += parsed
+    return parsed
+
+
+def _finalize_usage_bucket(bucket: dict[str, Any]) -> dict[str, Any]:
+    out = dict(bucket)
+    rows_with_total_tokens = int(out["rows_with_total_tokens"])
+    rows_with_latency = int(out["rows_with_latency"])
+    rows_with_tokens_per_second = int(out["rows_with_tokens_per_second"])
+
+    out["avg_total_tokens"] = (
+        round(out["total_tokens_total"] / rows_with_total_tokens, 4)
+        if rows_with_total_tokens > 0
+        else None
+    )
+    out["avg_latency_ms"] = (
+        round(out["latency_ms_total"] / rows_with_latency, 2)
+        if rows_with_latency > 0
+        else None
+    )
+    out["avg_tokens_per_second"] = (
+        round(out["tokens_per_second_total"] / rows_with_tokens_per_second, 4)
+        if rows_with_tokens_per_second > 0
+        else None
+    )
+
+    out["cost_usd_total"] = round(float(out["cost_usd_total"]), 8)
+    out["upstream_inference_cost_usd_total"] = round(
+        float(out["upstream_inference_cost_usd_total"]), 8
+    )
+    out["upstream_inference_prompt_cost_usd_total"] = round(
+        float(out["upstream_inference_prompt_cost_usd_total"]), 8
+    )
+    out["upstream_inference_completions_cost_usd_total"] = round(
+        float(out["upstream_inference_completions_cost_usd_total"]), 8
+    )
+    out["tokens_per_second_total"] = round(float(out["tokens_per_second_total"]), 6)
+    return out
+
+
+def summarize_collect_usage(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    overall = _new_usage_bucket()
+    by_model: dict[str, dict[str, Any]] = defaultdict(_new_usage_bucket)
+
+    for row in rows:
+        model = str(row.get("model", ""))
+        buckets = [overall, by_model[model]]
+
+        has_usage = isinstance(row.get("response_usage"), dict) and bool(
+            row.get("response_usage")
+        )
+        is_error = bool(row.get("error"))
+        byok = _coerce_bool(row.get("response_usage_is_byok"))
+
+        for bucket in buckets:
+            bucket["rows"] += 1
+            if is_error:
+                bucket["error_rows"] += 1
+            else:
+                bucket["success_rows"] += 1
+            if has_usage:
+                bucket["rows_with_usage"] += 1
+            if byok is True:
+                bucket["rows_with_byok_true"] += 1
+
+            _add_if_int(bucket, "prompt_tokens_total", row.get("response_prompt_tokens"))
+            _add_if_int(
+                bucket, "completion_tokens_total", row.get("response_completion_tokens")
+            )
+            total_tokens = _add_if_int(
+                bucket, "total_tokens_total", row.get("response_total_tokens")
+            )
+            if total_tokens is not None:
+                bucket["rows_with_total_tokens"] += 1
+            _add_if_int(
+                bucket, "reasoning_tokens_total", row.get("response_reasoning_tokens")
+            )
+            _add_if_int(
+                bucket,
+                "cached_prompt_tokens_total",
+                row.get("response_cached_prompt_tokens"),
+            )
+            _add_if_int(
+                bucket,
+                "cache_write_tokens_total",
+                row.get("response_cache_write_tokens"),
+            )
+            cost = _add_if_float(bucket, "cost_usd_total", row.get("response_cost_usd"))
+            if cost is not None:
+                bucket["rows_with_cost"] += 1
+            _add_if_float(
+                bucket,
+                "upstream_inference_cost_usd_total",
+                row.get("response_upstream_inference_cost_usd"),
+            )
+            _add_if_float(
+                bucket,
+                "upstream_inference_prompt_cost_usd_total",
+                row.get("response_upstream_inference_prompt_cost_usd"),
+            )
+            _add_if_float(
+                bucket,
+                "upstream_inference_completions_cost_usd_total",
+                row.get("response_upstream_inference_completions_cost_usd"),
+            )
+            _add_if_int(
+                bucket, "response_char_count_total", row.get("response_char_count")
+            )
+            latency_ms = _add_if_int(bucket, "latency_ms_total", row.get("response_latency_ms"))
+            if latency_ms is not None:
+                bucket["rows_with_latency"] += 1
+            tps = _add_if_float(
+                bucket, "tokens_per_second_total", row.get("response_tokens_per_second")
+            )
+            if tps is not None:
+                bucket["rows_with_tokens_per_second"] += 1
+
+    by_model_rows = [
+        {"model": model, **_finalize_usage_bucket(bucket)}
+        for model, bucket in by_model.items()
+    ]
+    by_model_rows.sort(
+        key=lambda row: (
+            -int(row.get("total_tokens_total", 0) or 0),
+            str(row.get("model", "")),
+        )
+    )
+    return {
+        "overall": _finalize_usage_bucket(overall),
+        "by_model": by_model_rows,
+    }
+
+
+def is_rate_limit_error_record(row: dict[str, Any]) -> bool:
+    if str(row.get("error_kind", "")).strip() == "rate_limit":
+        return True
+    status = _coerce_int(row.get("error_http_status"))
+    if status == 429:
+        return True
+    error_text = str(row.get("error", "")).lower()
+    return ("http 429" in error_text) or ("rate limit" in error_text)
+
+
 def write_collect_review_csv(path: pathlib.Path, rows: list[dict[str, Any]]) -> None:
     fieldnames = [
         "status",
@@ -1191,6 +1634,23 @@ def write_collect_review_csv(path: pathlib.Path, rows: list[dict[str, Any]]) -> 
         "technique",
         "is_control",
         "response_latency_ms",
+        "response_prompt_tokens",
+        "response_completion_tokens",
+        "response_total_tokens",
+        "response_reasoning_tokens",
+        "response_cached_prompt_tokens",
+        "response_cache_write_tokens",
+        "response_cost_usd",
+        "response_upstream_inference_cost_usd",
+        "response_upstream_inference_prompt_cost_usd",
+        "response_upstream_inference_completions_cost_usd",
+        "response_usage_is_byok",
+        "response_char_count",
+        "response_tokens_per_second",
+        "error_kind",
+        "error_http_status",
+        "error_retryable",
+        "error_retry_after_seconds",
         "response_finish_reason",
         "warnings",
         "response_text",
@@ -1218,6 +1678,41 @@ def write_collect_review_csv(path: pathlib.Path, rows: list[dict[str, Any]]) -> 
                     "technique": row.get("technique", ""),
                     "is_control": bool(row.get("is_control", False)),
                     "response_latency_ms": row.get("response_latency_ms", ""),
+                    "response_prompt_tokens": row.get("response_prompt_tokens", ""),
+                    "response_completion_tokens": row.get(
+                        "response_completion_tokens", ""
+                    ),
+                    "response_total_tokens": row.get("response_total_tokens", ""),
+                    "response_reasoning_tokens": row.get(
+                        "response_reasoning_tokens", ""
+                    ),
+                    "response_cached_prompt_tokens": row.get(
+                        "response_cached_prompt_tokens", ""
+                    ),
+                    "response_cache_write_tokens": row.get(
+                        "response_cache_write_tokens", ""
+                    ),
+                    "response_cost_usd": row.get("response_cost_usd", ""),
+                    "response_upstream_inference_cost_usd": row.get(
+                        "response_upstream_inference_cost_usd", ""
+                    ),
+                    "response_upstream_inference_prompt_cost_usd": row.get(
+                        "response_upstream_inference_prompt_cost_usd", ""
+                    ),
+                    "response_upstream_inference_completions_cost_usd": row.get(
+                        "response_upstream_inference_completions_cost_usd", ""
+                    ),
+                    "response_usage_is_byok": row.get("response_usage_is_byok", ""),
+                    "response_char_count": row.get("response_char_count", ""),
+                    "response_tokens_per_second": row.get(
+                        "response_tokens_per_second", ""
+                    ),
+                    "error_kind": row.get("error_kind", ""),
+                    "error_http_status": row.get("error_http_status", ""),
+                    "error_retryable": row.get("error_retryable", ""),
+                    "error_retry_after_seconds": row.get(
+                        "error_retry_after_seconds", ""
+                    ),
                     "response_finish_reason": row.get("response_finish_reason", ""),
                     "warnings": "; ".join(str(x) for x in row.get("warnings", [])),
                     "response_text": row.get("response_text", ""),
@@ -1326,6 +1821,8 @@ def render_grade_review_markdown(rows: list[dict[str, Any]]) -> str:
 
 
 def normalize_message_content(content: Any) -> str:
+    if content is None:
+        return ""
     if isinstance(content, str):
         return content.strip()
     if isinstance(content, list):
@@ -1337,6 +1834,21 @@ def normalize_message_content(content: Any) -> str:
                     chunks.append(text)
         return "\n".join(chunks).strip()
     return str(content).strip()
+
+
+class OpenRouterAPIError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retryable: bool | None = None,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retryable = retryable
+        self.retry_after_seconds = retry_after_seconds
 
 
 class OpenRouterClient:
@@ -1385,6 +1897,7 @@ class OpenRouterClient:
         last_error: Exception | None = None
         for attempt in range(1, retries + 1):
             retry_after_header: str | None = None
+            retry_after_seconds: float | None = None
             request = urllib.request.Request(
                 self.base_url,
                 data=encoded,
@@ -1401,10 +1914,19 @@ class OpenRouterClient:
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="ignore")
                 retry_after_header = exc.headers.get("Retry-After") if exc.headers else None
+                retry_after_seconds = parse_retry_after_seconds(retry_after_header)
                 retryable = is_retryable_http_status(exc.code)
-                last_error = RuntimeError(
+                last_error = OpenRouterAPIError(
                     f"HTTP {exc.code} from OpenRouter (attempt {attempt}/{retries})"
                     f"{' [retryable]' if retryable else ' [non-retryable]'}: {detail}"
+                    + (
+                        f" (retry_after_seconds={retry_after_seconds})"
+                        if retry_after_seconds is not None
+                        else ""
+                    ),
+                    status_code=exc.code,
+                    retryable=retryable,
+                    retry_after_seconds=retry_after_seconds,
                 )
                 if not retryable:
                     raise last_error from exc
@@ -1435,6 +1957,19 @@ def extract_model_text(api_response: dict[str, Any]) -> str:
     if not isinstance(message, dict):
         raise RuntimeError("API response choice.message is not an object.")
     return normalize_message_content(message.get("content", ""))
+
+
+def extract_message_refusal(api_response: dict[str, Any]) -> str:
+    choices = api_response.get("choices", [])
+    if not choices or not isinstance(choices, list):
+        return ""
+    first_choice = choices[0] if choices else {}
+    if not isinstance(first_choice, dict):
+        return ""
+    message = first_choice.get("message", {})
+    if not isinstance(message, dict):
+        return ""
+    return normalize_message_content(message.get("refusal", ""))
 
 
 def extract_finish_reason(api_response: dict[str, Any]) -> str | None:
@@ -1502,6 +2037,7 @@ def collect_one(
     omit_system_prompt: bool,
     temperature: float | None,
     max_tokens: int,
+    empty_response_retries: int,
     retries: int,
     pause_seconds: float,
     dry_run: bool,
@@ -1561,8 +2097,13 @@ def collect_one(
         "response_raw": None,
         "started_at_utc": started_at,
         "finished_at_utc": None,
+        "error_kind": "",
+        "error_http_status": None,
+        "error_retryable": None,
+        "error_retry_after_seconds": None,
         "error": "",
     }
+    enrich_collect_record_metrics(record)
 
     try:
         if pause_seconds > 0:
@@ -1586,22 +2127,67 @@ def collect_one(
                     "reasoning": {"effort": effort_value},
                     "provider": {"require_parameters": True},
                 }
-            payload = client.chat(
-                model=task.get("model_id", task["model"]),
-                messages=request_messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                retries=retries,
-                extra_payload=extra_payload,
-            )
-            if store_response_raw:
-                record["response_raw"] = payload
-            response_text = extract_model_text(payload)
-            if not response_text.strip():
+            empty_attempt = 0
+            payload = {}
+            effective_max_tokens = max_tokens
+            while True:
+                try:
+                    payload = client.chat(
+                        model=task.get("model_id", task["model"]),
+                        messages=request_messages,
+                        temperature=temperature,
+                        max_tokens=effective_max_tokens,
+                        retries=retries,
+                        extra_payload=extra_payload,
+                    )
+                except OpenRouterAPIError as exc:
+                    # Some providers reject unbounded or overly-large token caps when
+                    # account credits are low. Retry once with a smaller cap.
+                    if (
+                        exc.status_code == 402
+                        and "fewer max_tokens" in str(exc).lower()
+                    ):
+                        if effective_max_tokens <= 0:
+                            next_max_tokens = 1024
+                        elif effective_max_tokens > 128:
+                            next_max_tokens = max(128, effective_max_tokens // 2)
+                        else:
+                            raise
+                        if next_max_tokens == effective_max_tokens:
+                            raise
+                        record["warnings"].append(
+                            "max_tokens_auto_reduced_after_402="
+                            f"{effective_max_tokens}->{next_max_tokens}"
+                        )
+                        effective_max_tokens = next_max_tokens
+                        continue
+                    raise
+                if store_response_raw:
+                    record["response_raw"] = payload
+                response_text = extract_model_text(payload)
+                if response_text.strip():
+                    break
+
+                refusal_text = extract_message_refusal(payload)
+                if refusal_text.strip():
+                    response_text = refusal_text
+                    record["warnings"].append("response_text_fallback=message.refusal")
+                    break
+
                 finish_reason = extract_finish_reason(payload)
-                raise RuntimeError(
-                    f"API returned empty response_text (finish_reason={finish_reason})."
+                if empty_attempt < empty_response_retries:
+                    empty_attempt += 1
+                    continue
+
+                response_text = EMPTY_MODEL_RESPONSE_PLACEHOLDER
+                record["warnings"].append(
+                    "response_text_fallback=empty_placeholder"
                 )
+                if finish_reason is not None:
+                    record["warnings"].append(
+                        f"empty_response_finish_reason={finish_reason}"
+                    )
+                break
 
         record["response_text"] = response_text
         record["response_id"] = str(payload.get("id", ""))
@@ -1614,9 +2200,18 @@ def collect_one(
             record["response_raw"] = payload
     except Exception as exc:  # pylint: disable=broad-except
         record["error"] = str(exc)
+        if isinstance(exc, OpenRouterAPIError):
+            status_code = exc.status_code
+            record["error_http_status"] = status_code
+            record["error_retryable"] = exc.retryable
+            record["error_retry_after_seconds"] = exc.retry_after_seconds
+            record["error_kind"] = "rate_limit" if status_code == 429 else "api_error"
+        else:
+            record["error_kind"] = "runtime_error"
     finally:
         record["response_latency_ms"] = int((time.perf_counter() - t0) * 1000)
         record["finished_at_utc"] = utc_now_iso()
+        enrich_collect_record_metrics(record)
 
     return record
 
@@ -1635,6 +2230,20 @@ def run_collect(args: argparse.Namespace) -> int:
         raise ValueError("--num-runs must be >= 1")
     if args.parallelism < 1:
         raise ValueError("--parallelism must be >= 1")
+    if args.max_inflight_per_model < 0:
+        raise ValueError("--max-inflight-per-model must be >= 0")
+    if args.rate_limit_max_attempts < 1:
+        raise ValueError("--rate-limit-max-attempts must be >= 1")
+    if args.rate_limit_cooldown_seconds < 0:
+        raise ValueError("--rate-limit-cooldown-seconds must be >= 0")
+    if args.rate_limit_cooldown_max_seconds < 0:
+        raise ValueError("--rate-limit-cooldown-max-seconds must be >= 0")
+    if args.rate_limit_cooldown_jitter_seconds < 0:
+        raise ValueError("--rate-limit-cooldown-jitter-seconds must be >= 0")
+    if args.checkpoint_fsync_every < 0:
+        raise ValueError("--checkpoint-fsync-every must be >= 0")
+    if args.empty_response_retries < 0:
+        raise ValueError("--empty-response-retries must be >= 0")
     validate_retry_and_timeout(args.retries, args.timeout_seconds)
 
     models = load_models(args.models, args.models_file)
@@ -1646,10 +2255,18 @@ def run_collect(args: argparse.Namespace) -> int:
     )
     unknown_reasoning_models = set(per_model_reasoning_efforts.keys()) - set(models)
     if unknown_reasoning_models:
-        unknown_sorted = ", ".join(sorted(unknown_reasoning_models))
-        raise ValueError(
-            "model_reasoning_efforts contains model(s) not in selected models: "
-            f"{unknown_sorted}"
+        if cli_option_was_provided(args, "model_reasoning_efforts"):
+            unknown_sorted = ", ".join(sorted(unknown_reasoning_models))
+            raise ValueError(
+                "model_reasoning_efforts contains model(s) not in selected models: "
+                f"{unknown_sorted}"
+            )
+        for unknown_model in unknown_reasoning_models:
+            per_model_reasoning_efforts.pop(unknown_model, None)
+        print(
+            "Ignoring config model_reasoning_efforts for models not in current --models "
+            f"selection: {', '.join(sorted(unknown_reasoning_models))}",
+            flush=True,
         )
     model_variants = build_model_variants(
         models, base_reasoning_effort, per_model_reasoning_efforts
@@ -1704,6 +2321,8 @@ def run_collect(args: argparse.Namespace) -> int:
         if checkpoint_records and checkpoint_source != partial_responses_path:
             # Keep all incremental progress in one append-only file after resume.
             write_jsonl(partial_responses_path, checkpoint_records)
+    for checkpoint_row in checkpoint_records:
+        enrich_collect_record_metrics(checkpoint_row)
 
     tasks_to_run = [
         task
@@ -1724,6 +2343,7 @@ def run_collect(args: argparse.Namespace) -> int:
         "num_runs": args.num_runs,
         "task_count": len(tasks),
         "parallelism": args.parallelism,
+        "max_inflight_per_model": args.max_inflight_per_model,
         "temperature": args.temperature,
         "max_tokens": args.max_tokens,
         "response_system_prompt": None
@@ -1739,6 +2359,12 @@ def run_collect(args: argparse.Namespace) -> int:
         "techniques_filter": techniques_filter,
         "shuffle_tasks": bool(args.shuffle_tasks),
         "seed": args.seed,
+        "rate_limit_requeue": bool(args.rate_limit_requeue),
+        "rate_limit_cooldown_seconds": args.rate_limit_cooldown_seconds,
+        "rate_limit_cooldown_max_seconds": args.rate_limit_cooldown_max_seconds,
+        "rate_limit_cooldown_jitter_seconds": args.rate_limit_cooldown_jitter_seconds,
+        "rate_limit_max_attempts": args.rate_limit_max_attempts,
+        "checkpoint_fsync_every": args.checkpoint_fsync_every,
         "dry_run": bool(args.dry_run),
         "stateless_request": True,
         "fail_on_error": bool(args.fail_on_error),
@@ -1751,18 +2377,6 @@ def run_collect(args: argparse.Namespace) -> int:
         collect_events_path.write_text("", encoding="utf-8")
     elif not collect_events_path.exists():
         collect_events_path.write_text("", encoding="utf-8")
-    append_jsonl(
-        collect_events_path,
-        {
-            "timestamp_utc": utc_now_iso(),
-            "phase": "collect",
-            "event": "resume_start" if args.resume else "start",
-            "run_id": run_id,
-            "checkpoint_rows": len(checkpoint_records),
-            "remaining_rows": len(tasks_to_run),
-        },
-    )
-
     client: OpenRouterClient | None = None
     if not args.dry_run:
         api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
@@ -1774,14 +2388,90 @@ def run_collect(args: argparse.Namespace) -> int:
     records: list[dict[str, Any]] = list(checkpoint_records)
     total = len(tasks)
     completed = len(checkpoint_records)
+    attempt_count = 0
+    rate_limit_requeue_count = 0
+    final_rate_limit_error_count = 0
+    task_attempts: dict[str, int] = defaultdict(int)
 
-    if tasks_to_run:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.parallelism) as pool:
-            in_flight: dict[concurrent.futures.Future[dict[str, Any]], dict[str, Any]] = {}
-            task_iter = iter(tasks_to_run)
+    with JsonlAppender(
+        partial_responses_path, fsync_every=args.checkpoint_fsync_every
+    ) as partial_writer, JsonlAppender(
+        collect_events_path, fsync_every=args.checkpoint_fsync_every
+    ) as events_writer:
+        events_writer.append(
+            {
+                "timestamp_utc": utc_now_iso(),
+                "phase": "collect",
+                "event": "resume_start" if args.resume else "start",
+                "run_id": run_id,
+                "checkpoint_rows": len(checkpoint_records),
+                "remaining_rows": len(tasks_to_run),
+            }
+        )
 
-            def submit_collect_task(task: dict[str, Any]) -> None:
-                future = pool.submit(
+        if tasks_to_run:
+            pending_by_model: dict[str, deque[dict[str, Any]]] = defaultdict(deque)
+            for task in tasks_to_run:
+                pending_by_model[str(task.get("model", ""))].append(task)
+            model_order = sorted(pending_by_model.keys())
+            model_next_ready_at: dict[str, float] = defaultdict(float)
+            model_in_flight: dict[str, int] = defaultdict(int)
+            round_robin_index = 0
+
+            def pending_task_count() -> int:
+                return sum(len(queue) for queue in pending_by_model.values())
+
+            def model_can_submit(model: str) -> bool:
+                if args.max_inflight_per_model <= 0:
+                    return True
+                return model_in_flight.get(model, 0) < args.max_inflight_per_model
+
+            def pop_next_ready_task(now_ts: float) -> dict[str, Any] | None:
+                nonlocal round_robin_index
+                if not model_order:
+                    return None
+                model_count = len(model_order)
+                for offset in range(model_count):
+                    idx = (round_robin_index + offset) % model_count
+                    model = model_order[idx]
+                    queue = pending_by_model.get(model)
+                    if not queue:
+                        continue
+                    if not model_can_submit(model):
+                        continue
+                    if model_next_ready_at.get(model, 0.0) > now_ts:
+                        continue
+                    task = queue.popleft()
+                    round_robin_index = (idx + 1) % model_count
+                    return task
+                return None
+
+            def next_wake_time(now_ts: float) -> float:
+                ready_times: list[float] = []
+                for model in model_order:
+                    queue = pending_by_model.get(model)
+                    if not queue:
+                        continue
+                    if not model_can_submit(model):
+                        continue
+                    ready_times.append(max(model_next_ready_at.get(model, 0.0), now_ts))
+                if not ready_times:
+                    return now_ts + 0.1
+                return min(ready_times)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=args.parallelism) as pool:
+                in_flight: dict[
+                    concurrent.futures.Future[dict[str, Any]],
+                    tuple[dict[str, Any], int],
+                ] = {}
+
+                def submit_collect_task(task: dict[str, Any]) -> None:
+                    sample_id = sample_id_from_row(task, context="Collect task list")
+                    next_attempt = task_attempts.get(sample_id, 0) + 1
+                    task_attempts[sample_id] = next_attempt
+                    model = str(task.get("model", ""))
+                    model_in_flight[model] = model_in_flight.get(model, 0) + 1
+                    future = pool.submit(
                     collect_one,
                     task,
                     client=client,
@@ -1789,98 +2479,187 @@ def run_collect(args: argparse.Namespace) -> int:
                     omit_system_prompt=omit_system_prompt,
                     temperature=args.temperature,
                     max_tokens=args.max_tokens,
+                    empty_response_retries=args.empty_response_retries,
                     retries=args.retries,
                     pause_seconds=args.pause_seconds,
                     dry_run=args.dry_run,
                     store_request_messages=bool(args.store_request_messages),
                     store_response_raw=bool(args.store_response_raw),
-                )
-                in_flight[future] = task
-
-            for _ in range(min(args.parallelism, len(tasks_to_run))):
-                try:
-                    submit_collect_task(next(task_iter))
-                except StopIteration:
-                    break
-
-            while in_flight:
-                done, _ = concurrent.futures.wait(
-                    in_flight,
-                    return_when=concurrent.futures.FIRST_COMPLETED,
-                )
-                for future in done:
-                    task = in_flight.pop(future)
-                    completed += 1
-                    try:
-                        record = future.result()
-                    except Exception as exc:  # pylint: disable=broad-except
-                        question = task["question"]
-                        record = {
-                            "sample_id": task["sample_id"],
-                            "run_index": task["run_index"],
-                            "model": task["model"],
-                            "model_id": task.get("model_id", task["model"]),
-                            "model_org": task.get("model_org", "unknown"),
-                            "model_name": task.get(
-                                "model_name", task.get("model_id", task["model"])
-                            ),
-                            "model_reasoning_level": task.get(
-                                "model_reasoning_level", "default"
-                            ),
-                            "model_row": task.get("model_row", task["model"]),
-                            "response_reasoning_effort": task.get(
-                                "response_reasoning_effort"
-                            ),
-                            "question_id": question["id"],
-                            "technique": question["technique"],
-                            "is_control": bool(question.get("is_control", False)),
-                            "domain": question["domain"],
-                            "question": question["question"],
-                            "nonsensical_element": question["nonsensical_element"],
-                            "stateless_request": True,
-                            "request_messages": [],
-                            "response_text": "",
-                            "response_id": "",
-                            "response_usage": {},
-                            "response_latency_ms": None,
-                            "response_created": None,
-                            "response_finish_reason": None,
-                            "warnings": [],
-                            "response_raw": None,
-                            "started_at_utc": None,
-                            "finished_at_utc": utc_now_iso(),
-                            "error": f"Worker failure: {exc}",
-                        }
-                    record["status"] = "error" if record.get("error") else "ok"
-                    records.append(record)
-                    append_jsonl(partial_responses_path, record)
-                    status = record["status"]
-                    append_jsonl(
-                        collect_events_path,
-                        {
-                            "timestamp_utc": utc_now_iso(),
-                            "phase": "collect",
-                            "event": "task_complete",
-                            "status": status,
-                            "sample_id": record.get("sample_id"),
-                            "model": record.get("model"),
-                            "question_id": record.get("question_id"),
-                            "run_index": record.get("run_index"),
-                            "error": record.get("error", ""),
-                        },
                     )
-                    error_suffix = f" error={record.get('error')}" if status == "error" else ""
-                    print(
-                        f"[collect {completed}/{total}] {status} "
-                        f"model={record['model']} question={record['question_id']} run={record['run_index']}"
-                        f"{error_suffix}",
-                        flush=True,
-                    )
+                    in_flight[future] = (task, next_attempt)
 
-                    try:
-                        submit_collect_task(next(task_iter))
-                    except StopIteration:
-                        pass
+                while completed < total:
+                    while len(in_flight) < args.parallelism:
+                        next_task = pop_next_ready_task(time.time())
+                        if next_task is None:
+                            break
+                        submit_collect_task(next_task)
+
+                    if not in_flight:
+                        if pending_task_count() == 0:
+                            break
+                        now_ts = time.time()
+                        wake_at = next_wake_time(now_ts)
+                        sleep_seconds = max(0.05, min(wake_at - now_ts, 2.0))
+                        time.sleep(sleep_seconds)
+                        continue
+
+                    done, _ = concurrent.futures.wait(
+                        in_flight,
+                        return_when=concurrent.futures.FIRST_COMPLETED,
+                        timeout=1.0,
+                    )
+                    if not done:
+                        continue
+
+                    for future in done:
+                        task, attempt = in_flight.pop(future)
+                        attempt_count += 1
+                        model = str(task.get("model", ""))
+                        if model_in_flight.get(model, 0) > 0:
+                            model_in_flight[model] -= 1
+
+                        try:
+                            record = future.result()
+                        except Exception as exc:  # pylint: disable=broad-except
+                            question = task["question"]
+                            record = {
+                                "sample_id": task["sample_id"],
+                                "run_index": task["run_index"],
+                                "model": task["model"],
+                                "model_id": task.get("model_id", task["model"]),
+                                "model_org": task.get("model_org", "unknown"),
+                                "model_name": task.get(
+                                    "model_name", task.get("model_id", task["model"])
+                                ),
+                                "model_reasoning_level": task.get(
+                                    "model_reasoning_level", "default"
+                                ),
+                                "model_row": task.get("model_row", task["model"]),
+                                "response_reasoning_effort": task.get(
+                                    "response_reasoning_effort"
+                                ),
+                                "question_id": question["id"],
+                                "technique": question["technique"],
+                                "is_control": bool(question.get("is_control", False)),
+                                "domain": question["domain"],
+                                "question": question["question"],
+                                "nonsensical_element": question["nonsensical_element"],
+                                "stateless_request": True,
+                                "request_messages": [],
+                                "response_text": "",
+                                "response_id": "",
+                                "response_usage": {},
+                                "response_latency_ms": None,
+                                "response_created": None,
+                                "response_finish_reason": None,
+                                "warnings": [],
+                                "response_raw": None,
+                                "started_at_utc": None,
+                                "finished_at_utc": utc_now_iso(),
+                                "error_kind": "runtime_error",
+                                "error_http_status": None,
+                                "error_retryable": None,
+                                "error_retry_after_seconds": None,
+                                "error": f"Worker failure: {exc}",
+                            }
+                        enrich_collect_record_metrics(record)
+                        record["collect_attempt"] = attempt
+
+                        should_requeue_for_rate_limit = False
+                        if args.rate_limit_requeue and record.get("error"):
+                            if is_rate_limit_error_record(record):
+                                if attempt < args.rate_limit_max_attempts:
+                                    retry_after_seconds = _coerce_float(
+                                        record.get("error_retry_after_seconds")
+                                    )
+                                    if (
+                                        retry_after_seconds is not None
+                                        and retry_after_seconds >= 0
+                                    ):
+                                        cooldown = retry_after_seconds
+                                    else:
+                                        cooldown = (
+                                            args.rate_limit_cooldown_seconds
+                                            * min(float(2 ** (attempt - 1)), 16.0)
+                                        )
+                                    cooldown = max(cooldown, 0.0)
+                                    if args.rate_limit_cooldown_max_seconds > 0:
+                                        cooldown = min(
+                                            cooldown,
+                                            args.rate_limit_cooldown_max_seconds,
+                                        )
+                                    if args.rate_limit_cooldown_jitter_seconds > 0:
+                                        cooldown += random.uniform(
+                                            0.0, args.rate_limit_cooldown_jitter_seconds
+                                        )
+                                    retry_at_epoch = time.time() + cooldown
+                                    model_next_ready_at[model] = max(
+                                        model_next_ready_at.get(model, 0.0),
+                                        retry_at_epoch,
+                                    )
+                                    pending_by_model[model].append(task)
+                                    should_requeue_for_rate_limit = True
+                                    rate_limit_requeue_count += 1
+                                    retry_at_iso = dt.datetime.fromtimestamp(
+                                        retry_at_epoch, tz=dt.UTC
+                                    ).isoformat()
+                                    events_writer.append(
+                                        {
+                                            "timestamp_utc": utc_now_iso(),
+                                            "phase": "collect",
+                                            "event": "task_rate_limit_requeue",
+                                            "sample_id": record.get("sample_id"),
+                                            "model": record.get("model"),
+                                            "question_id": record.get("question_id"),
+                                            "run_index": record.get("run_index"),
+                                            "attempt": attempt,
+                                            "retry_at_utc": retry_at_iso,
+                                            "cooldown_seconds": round(cooldown, 3),
+                                            "error": record.get("error", ""),
+                                        }
+                                    )
+                                    print(
+                                        f"[collect {completed}/{total}] requeue rate_limit "
+                                        f"model={record.get('model')} question={record.get('question_id')} "
+                                        f"run={record.get('run_index')} attempt={attempt} "
+                                        f"cooldown={cooldown:.2f}s",
+                                        flush=True,
+                                    )
+                                else:
+                                    final_rate_limit_error_count += 1
+
+                        if should_requeue_for_rate_limit:
+                            continue
+
+                        completed += 1
+                        record["status"] = "error" if record.get("error") else "ok"
+                        records.append(record)
+                        partial_writer.append(record)
+                        status = record["status"]
+                        events_writer.append(
+                            {
+                                "timestamp_utc": utc_now_iso(),
+                                "phase": "collect",
+                                "event": "task_complete",
+                                "status": status,
+                                "sample_id": record.get("sample_id"),
+                                "model": record.get("model"),
+                                "question_id": record.get("question_id"),
+                                "run_index": record.get("run_index"),
+                                "attempt": attempt,
+                                "error": record.get("error", ""),
+                            }
+                        )
+                        error_suffix = (
+                            f" error={record.get('error')}" if status == "error" else ""
+                        )
+                        print(
+                            f"[collect {completed}/{total}] {status} "
+                            f"model={record['model']} question={record['question_id']} run={record['run_index']} "
+                            f"attempt={attempt}{error_suffix}",
+                            flush=True,
+                        )
 
     validate_collect_integrity(tasks, records)
 
@@ -1892,6 +2671,8 @@ def run_collect(args: argparse.Namespace) -> int:
             str(row.get("question_id", "")),
         )
     )
+    for row in records:
+        enrich_collect_record_metrics(row)
     write_jsonl(final_responses_path, records)
 
     elapsed = round(time.perf_counter() - started, 3)
@@ -1900,9 +2681,14 @@ def run_collect(args: argparse.Namespace) -> int:
         "total_records": len(records),
         "error_count": sum(1 for row in records if row.get("error")),
         "success_count": sum(1 for row in records if not row.get("error")),
+        "attempt_count": attempt_count,
+        "max_attempt_observed": max(task_attempts.values(), default=0),
+        "rate_limit_requeue_count": rate_limit_requeue_count,
+        "final_rate_limit_error_count": final_rate_limit_error_count,
         "resumed": bool(args.resume),
         "checkpoint_rows_at_start": len(checkpoint_records),
         "new_rows_processed": len(tasks_to_run),
+        "usage_summary": summarize_collect_usage(records),
     }
     write_json(run_dir / "collection_stats.json", collection_stats)
     write_collect_review_csv(run_dir / "responses_review.csv", records)
@@ -2051,6 +2837,7 @@ def grade_one(
     judge_temperature: float | None,
     judge_reasoning_effort: str,
     judge_max_tokens: int,
+    judge_output_retries: int,
     store_judge_response_raw: bool,
     retries: int,
     pause_seconds: float,
@@ -2126,57 +2913,126 @@ def grade_one(
         judge_prompt = judge_prompt.replace("{nonsensical_element}", grade_row["nonsensical_element"])
         judge_prompt = judge_prompt.replace("{response}", response_text)
 
-        if dry_run:
-            if grade_row["is_control"] and not judge_no_hint:
-                judge_raw_text = json.dumps(
-                    {"justification": "Dry run placeholder grade.", "score": 3}
-                )
-            else:
-                judge_raw_text = json.dumps(
-                    {"justification": "Dry run placeholder grade.", "score": 1}
-                )
-            usage: dict[str, Any] = {}
-            grade_row["judge_response_id"] = "dry-run"
-            grade_row["judge_finish_reason"] = "stop"
-        else:
-            assert client is not None
-            judge_response_format = pick_judge_response_format(
-                judge_model,
-                allow_score_3=bool(grade_row["is_control"]),
-            )
-            extra_payload: dict[str, Any] = {
-                "response_format": judge_response_format,
-                "provider": {"require_parameters": True},
-            }
-            if judge_reasoning_effort != "off":
-                extra_payload["reasoning"] = {"effort": judge_reasoning_effort}
-            api_payload = client.chat(
-                model=judge_model,
-                messages=[
-                    {"role": "system", "content": judge_system_prompt},
-                    {"role": "user", "content": judge_prompt},
-                ],
-                temperature=judge_temperature,
-                max_tokens=judge_max_tokens,
-                retries=retries,
-                extra_payload=extra_payload,
-            )
-            if store_judge_response_raw:
-                grade_row["judge_response_raw"] = api_payload
-            grade_row["judge_response_id"] = str(api_payload.get("id", ""))
-            grade_row["judge_response_created"] = api_payload.get("created")
-            grade_row["judge_finish_reason"] = extract_finish_reason(api_payload)
-            if grade_row["judge_finish_reason"] == "length":
-                grade_row["judge_warnings"].append(
-                    "judge_finish_reason=length (possible truncation)"
-                )
-            judge_raw_text = extract_model_text(api_payload)
-            usage = api_payload.get("usage", {})
-        grade_row["judge_raw_text"] = judge_raw_text
-        if not judge_raw_text.strip():
-            grade_row["judge_warnings"].append("judge_raw_text_empty")
+        score: int | None = None
+        justification = ""
+        parse_mode = ""
+        usage: dict[str, Any] = {}
+        max_attempts = max(1, judge_output_retries + 1)
+        last_parse_error: Exception | None = None
+        effective_judge_max_tokens = judge_max_tokens
 
-        score, justification, parse_mode = parse_judge_output(judge_raw_text)
+        for judge_attempt in range(1, max_attempts + 1):
+            if dry_run:
+                if grade_row["is_control"] and not judge_no_hint:
+                    judge_raw_text = json.dumps(
+                        {"justification": "Dry run placeholder grade.", "score": 3}
+                    )
+                else:
+                    judge_raw_text = json.dumps(
+                        {"justification": "Dry run placeholder grade.", "score": 1}
+                    )
+                usage = {}
+                grade_row["judge_response_id"] = "dry-run"
+                grade_row["judge_response_created"] = None
+                grade_row["judge_finish_reason"] = "stop"
+            else:
+                assert client is not None
+                judge_response_format = pick_judge_response_format(
+                    judge_model,
+                    allow_score_3=bool(grade_row["is_control"]),
+                )
+                extra_payload: dict[str, Any] = {
+                    "response_format": judge_response_format,
+                    "provider": {"require_parameters": True},
+                }
+                if judge_reasoning_effort != "off":
+                    extra_payload["reasoning"] = {"effort": judge_reasoning_effort}
+                while True:
+                    try:
+                        api_payload = client.chat(
+                            model=judge_model,
+                            messages=[
+                                {"role": "system", "content": judge_system_prompt},
+                                {"role": "user", "content": judge_prompt},
+                            ],
+                            temperature=judge_temperature,
+                            max_tokens=effective_judge_max_tokens,
+                            retries=retries,
+                            extra_payload=extra_payload,
+                        )
+                        break
+                    except OpenRouterAPIError as exc:
+                        if (
+                            exc.status_code == 402
+                            and "fewer max_tokens" in str(exc).lower()
+                        ):
+                            if effective_judge_max_tokens <= 0:
+                                next_max_tokens = 1024
+                            elif effective_judge_max_tokens > 128:
+                                next_max_tokens = max(128, effective_judge_max_tokens // 2)
+                            else:
+                                raise
+                            if next_max_tokens == effective_judge_max_tokens:
+                                raise
+                            grade_row["judge_warnings"].append(
+                                "judge_max_tokens_auto_reduced_after_402="
+                                f"{effective_judge_max_tokens}->{next_max_tokens}"
+                            )
+                            effective_judge_max_tokens = next_max_tokens
+                            continue
+                        raise
+                if store_judge_response_raw:
+                    grade_row["judge_response_raw"] = api_payload
+                grade_row["judge_response_id"] = str(api_payload.get("id", ""))
+                grade_row["judge_response_created"] = api_payload.get("created")
+                grade_row["judge_finish_reason"] = extract_finish_reason(api_payload)
+                if grade_row["judge_finish_reason"] == "length":
+                    grade_row["judge_warnings"].append(
+                        "judge_finish_reason=length (possible truncation)"
+                    )
+                judge_raw_text = extract_model_text(api_payload)
+                usage = api_payload.get("usage", {})
+
+            grade_row["judge_raw_text"] = judge_raw_text
+            if not judge_raw_text.strip():
+                grade_row["judge_warnings"].append("judge_raw_text_empty")
+                if judge_attempt < max_attempts:
+                    grade_row["judge_warnings"].append(
+                        f"judge_retry_on_empty={judge_attempt}"
+                    )
+                    continue
+
+            try:
+                score, justification, parse_mode = parse_judge_output(judge_raw_text)
+                last_parse_error = None
+                break
+            except Exception as parse_exc:  # pylint: disable=broad-except
+                last_parse_error = parse_exc
+                if judge_attempt < max_attempts and not dry_run:
+                    grade_row["judge_warnings"].append(
+                        f"judge_retry_on_parse_error={judge_attempt}"
+                    )
+                    continue
+                break
+
+        if score is None or last_parse_error is not None:
+            final_raw = str(grade_row.get("judge_raw_text", "")).strip()
+            if not final_raw:
+                score = 0
+                justification = (
+                    "Fallback score: judge returned empty output after retries, "
+                    "so this response is treated as failing to challenge the premise."
+                )
+                parse_mode = "fallback_empty_judge_output"
+                grade_row["judge_warnings"].append(
+                    "judge_fallback_score_on_empty_output"
+                )
+                last_parse_error = None
+            elif last_parse_error is not None:
+                raise last_parse_error
+            else:
+                raise RuntimeError("Judge returned no parseable output.")
+
         grade_row["judge_parse_mode"] = parse_mode
         if parse_mode != "direct":
             grade_row["judge_warnings"].append(
@@ -2426,6 +3282,8 @@ def run_grade(args: argparse.Namespace) -> int:
         raise ValueError("--resume for grade requires --grade-id.")
     if args.parallelism < 1:
         raise ValueError("--parallelism must be >= 1")
+    if args.judge_output_retries < 0:
+        raise ValueError("--judge-output-retries must be >= 0")
     validate_retry_and_timeout(args.retries, args.timeout_seconds)
     if not args.responses_file:
         raise ValueError("--responses-file is required (or set grade.responses_file in config).")
@@ -2537,6 +3395,7 @@ def run_grade(args: argparse.Namespace) -> int:
         "parallelism": args.parallelism,
         "judge_temperature": args.judge_temperature,
         "judge_max_tokens": args.judge_max_tokens,
+        "judge_output_retries": args.judge_output_retries,
         "store_judge_response_raw": bool(args.store_judge_response_raw),
         "judge_reasoning_effort": args.judge_reasoning_effort,
         "retries": args.retries,
@@ -2595,6 +3454,7 @@ def run_grade(args: argparse.Namespace) -> int:
                     judge_temperature=args.judge_temperature,
                     judge_reasoning_effort=args.judge_reasoning_effort,
                     judge_max_tokens=args.judge_max_tokens,
+                    judge_output_retries=args.judge_output_retries,
                     store_judge_response_raw=bool(args.store_judge_response_raw),
                     retries=args.retries,
                     pause_seconds=args.pause_seconds,
@@ -2753,6 +3613,7 @@ def _build_grade_args(
     judge_model: str,
     output_dir: pathlib.Path,
     grade_id: str,
+    resume: bool,
 ) -> argparse.Namespace:
     return argparse.Namespace(
         command="grade",
@@ -2765,6 +3626,7 @@ def _build_grade_args(
         judge_temperature=panel_args.judge_temperature,
         judge_reasoning_effort=panel_args.judge_reasoning_effort,
         judge_max_tokens=panel_args.judge_max_tokens,
+        judge_output_retries=panel_args.judge_output_retries,
         store_judge_response_raw=panel_args.store_judge_response_raw,
         pause_seconds=panel_args.pause_seconds,
         retries=panel_args.retries,
@@ -2773,7 +3635,7 @@ def _build_grade_args(
         judge_user_template_file=panel_args.judge_user_template_file,
         judge_no_hint=panel_args.judge_no_hint,
         dry_run=panel_args.dry_run,
-        resume=panel_args.resume,
+        resume=resume,
         fail_on_error=panel_args.fail_on_error,
         _skip_config_defaults=True,
         _raw_argv=getattr(panel_args, "_raw_argv", []),
@@ -2788,19 +3650,22 @@ def _run_grade_for_panel(
     output_dir: pathlib.Path,
     grade_id: str,
 ) -> pathlib.Path:
+    grade_dir = output_dir / "grades" / grade_id
+    resume_this_grade = bool(panel_args.resume) and grade_dir.exists()
     grade_args = _build_grade_args(
         panel_args,
         responses_file=responses_file,
         judge_model=judge_model,
         output_dir=output_dir,
         grade_id=grade_id,
+        resume=resume_this_grade,
     )
     exit_code = run_grade(grade_args)
     if exit_code != 0 and panel_args.fail_on_error:
         raise RuntimeError(
             f"Primary grading failed for judge={judge_model} with exit code={exit_code}"
         )
-    return output_dir / "grades" / grade_id
+    return grade_dir
 
 
 def _run_primary_judges_for_panel(
@@ -3027,6 +3892,9 @@ def _render_grade_panel_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append(f"- Panel ID: `{summary['panel_id']}`")
     lines.append(f"- Timestamp (UTC): `{summary['timestamp_utc']}`")
     lines.append(f"- Responses file: `{summary['responses_file']}`")
+    lines.append(f"- Panel mode: `{summary.get('panel_mode', 'unknown')}`")
+    if summary.get("judge_models"):
+        lines.append(f"- Judge models: `{', '.join(summary['judge_models'])}`")
     lines.append(f"- Primary judges: `{', '.join(summary['primary_judges'])}`")
     lines.append(f"- Resumed run: `{summary.get('resumed', False)}`")
     lines.append(
@@ -3041,11 +3909,16 @@ def _render_grade_panel_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append(f"- Tiebreaker judge: `{summary.get('tiebreaker_model') or 'none'}`")
     lines.append(f"- Disagreement rows: `{summary['disagreement_count']}`")
     lines.append(f"- Disagreement rate: `{summary['disagreement_rate']}`")
+    lines.append(f"- Consensus method: `{summary.get('consensus_method')}`")
     lines.append("")
     lines.append("## Artifacts")
     lines.append("")
     lines.append(f"- Panel directory: `{summary['panel_dir']}`")
     lines.append(f"- Primary grade dirs: `{', '.join(summary['primary_grade_dirs'])}`")
+    if summary.get("grade_dirs_for_aggregate"):
+        lines.append(
+            f"- Grade dirs for aggregate: `{', '.join(summary['grade_dirs_for_aggregate'])}`"
+        )
     if summary.get("tiebreaker_grade_dir"):
         lines.append(f"- Tiebreaker full grade dir: `{summary['tiebreaker_grade_dir']}`")
     lines.append(f"- Aggregate dir: `{summary['aggregate_dir']}`")
@@ -3071,44 +3944,22 @@ def run_grade_panel(args: argparse.Namespace) -> int:
     if (
         args.responses_file == GRADE_PANEL_DEFAULTS["responses_file"]
         and not cli_option_was_provided(args, "responses_file")
+        and isinstance(grade_config, dict)
     ):
-        configured_responses = (
-            panel_config.get("responses_file")
-            if isinstance(panel_config, dict)
-            else None
-        )
-        if not configured_responses and isinstance(grade_config, dict):
-            configured_responses = grade_config.get("responses_file")
+        configured_responses = grade_config.get("responses_file")
         if isinstance(configured_responses, str) and configured_responses.strip():
             args.responses_file = configured_responses.strip()
 
     if (
         args.judge_models == GRADE_PANEL_DEFAULTS["judge_models"]
         and not cli_option_was_provided(args, "judge_models")
+        and isinstance(grade_config, dict)
     ):
-        configured_judge_models = (
-            panel_config.get("judge_models")
-            if isinstance(panel_config, dict)
-            else None
-        )
-        if configured_judge_models is None and isinstance(grade_config, dict):
-            configured_judge_models = grade_config.get("judge_models")
+        configured_judge_models = grade_config.get("judge_models")
         if isinstance(configured_judge_models, list):
             args.judge_models = ",".join(str(item) for item in configured_judge_models)
         elif isinstance(configured_judge_models, str):
             args.judge_models = configured_judge_models
-
-    if (
-        args.tiebreaker_model == GRADE_PANEL_DEFAULTS["tiebreaker_model"]
-        and not cli_option_was_provided(args, "tiebreaker_model")
-    ):
-        configured_tiebreak = (
-            panel_config.get("tiebreaker_model")
-            if isinstance(panel_config, dict)
-            else None
-        )
-        if isinstance(configured_tiebreak, str) and configured_tiebreak.strip():
-            args.tiebreaker_model = configured_tiebreak.strip()
 
     if (
         args.parallelism == GRADE_PANEL_DEFAULTS["parallelism"]
@@ -3157,6 +4008,15 @@ def run_grade_panel(args: argparse.Namespace) -> int:
             args.judge_max_tokens = configured_max_tokens
 
     if (
+        args.judge_output_retries == GRADE_PANEL_DEFAULTS["judge_output_retries"]
+        and not cli_option_was_provided(args, "judge_output_retries")
+        and isinstance(grade_config, dict)
+    ):
+        configured_output_retries = grade_config.get("judge_output_retries")
+        if isinstance(configured_output_retries, int):
+            args.judge_output_retries = configured_output_retries
+
+    if (
         args.store_judge_response_raw
         == GRADE_PANEL_DEFAULTS["store_judge_response_raw"]
         and not cli_option_was_provided(args, "store_judge_response_raw")
@@ -3181,6 +4041,8 @@ def run_grade_panel(args: argparse.Namespace) -> int:
         raise ValueError("--responses-file is required for grade-panel.")
     if args.parallelism < 1:
         raise ValueError("--parallelism must be >= 1")
+    if args.judge_output_retries < 0:
+        raise ValueError("--judge-output-retries must be >= 0")
     validate_retry_and_timeout(args.retries, args.timeout_seconds)
 
     responses_file = pathlib.Path(args.responses_file)
@@ -3190,19 +4052,37 @@ def run_grade_panel(args: argparse.Namespace) -> int:
     if not source_rows:
         raise ValueError("responses file is empty.")
 
-    primary_judges = split_csv(args.judge_models)
+    judge_models = dedupe_preserve_order(split_csv(args.judge_models))
     tiebreaker_model = args.tiebreaker_model.strip()
 
-    if len(primary_judges) >= 3 and not tiebreaker_model:
-        tiebreaker_model = primary_judges[2]
-        primary_judges = primary_judges[:2]
-
-    if len(primary_judges) != 2:
+    if not judge_models and not tiebreaker_model:
         raise ValueError(
-            "--judge-models for grade-panel must resolve to exactly two primary judges."
+            "grade-panel requires judge models. Provide --judge-models "
+            "(and optionally --tiebreaker-model)."
         )
-    if tiebreaker_model and tiebreaker_model in primary_judges:
-        raise ValueError("tiebreaker model must be different from primary judge models.")
+
+    if tiebreaker_model:
+        raise ValueError(
+            "Canonical grade-panel no longer supports tiebreaker mode. "
+            "Provide exactly three judge models in --judge-models and leave --tiebreaker-model empty."
+        )
+
+    if len(judge_models) != 3:
+        raise ValueError(
+            "Canonical grade-panel requires exactly three unique judge models "
+            "(comma-separated in --judge-models)."
+        )
+
+    panel_mode = str(args.panel_mode).strip().lower()
+    if panel_mode not in {"full", "auto"}:
+        raise ValueError(
+            "Canonical grade-panel supports only full mode. "
+            "Use --panel-mode full (or leave default)."
+        )
+    panel_mode = "full"
+
+    judges_to_run_full = list(judge_models)
+    primary_judges = judges_to_run_full[:2]
 
     timestamp = dt.datetime.now(dt.UTC)
     panel_seed_id = args.panel_id.strip() or timestamp.strftime("%Y%m%d_%H%M%S")
@@ -3215,14 +4095,18 @@ def run_grade_panel(args: argparse.Namespace) -> int:
         resume=bool(args.resume),
     )
 
-    primary_grade_dirs = _run_primary_judges_for_panel(
+    grade_dirs_for_aggregate: list[pathlib.Path] = []
+    tiebreaker_full_grade_dir: pathlib.Path | None = None
+
+    grade_dirs_for_aggregate = _run_primary_judges_for_panel(
         args,
         responses_file=responses_file,
         panel_dir=panel_dir,
         panel_id=panel_id,
-        primary_judges=primary_judges,
+        primary_judges=judges_to_run_full,
     )
 
+    primary_grade_dirs = grade_dirs_for_aggregate[:2]
     first_set = load_grade_dir(str(primary_grade_dirs[0]))
     second_set = load_grade_dir(str(primary_grade_dirs[1]))
     disagreement_sample_ids = _identify_disagreement_sample_ids(
@@ -3238,72 +4122,14 @@ def run_grade_panel(args: argparse.Namespace) -> int:
     disagreement_file = panel_dir / "disagreement_responses.jsonl"
     write_jsonl(disagreement_file, disagreement_rows)
 
-    tiebreaker_full_grade_dir: pathlib.Path | None = None
-    grade_dirs_for_aggregate: list[pathlib.Path] = list(primary_grade_dirs)
-    if tiebreaker_model:
-        tiebreak_subset_grade_rows_by_sample: dict[str, dict[str, Any]] = {}
-        tiebreak_subset_grade_dir: pathlib.Path | None = None
-        if disagreement_rows:
-            tiebreak_subset_grade_id = (
-                f"{panel_id}__tiebreak_subset_{to_slug(tiebreaker_model)}"
-            )
-            tiebreak_subset_grade_dir = _run_grade_for_panel(
-                args,
-                responses_file=disagreement_file,
-                judge_model=tiebreaker_model,
-                output_dir=panel_dir,
-                grade_id=tiebreak_subset_grade_id,
-            )
-            tiebreak_subset_set = load_grade_dir(str(tiebreak_subset_grade_dir))
-            tiebreak_subset_grade_rows_by_sample = tiebreak_subset_set["rows_by_sample"]
-
-        tiebreak_full_grade_rows = _build_synthetic_tiebreak_rows(
-            source_rows,
-            tiebreaker_model=tiebreaker_model,
-            first_rows_by_sample=first_set["rows_by_sample"],
-            second_rows_by_sample=second_set["rows_by_sample"],
-            tiebreak_subset_rows_by_sample=tiebreak_subset_grade_rows_by_sample,
+    requested_consensus_method = str(args.consensus_method).strip().lower()
+    if requested_consensus_method not in {"auto", "mean"}:
+        raise ValueError(
+            "Canonical grade-panel supports only mean aggregation. "
+            "Use --consensus-method mean (or leave default)."
         )
-        tiebreak_full_grade_id = f"{panel_id}__tiebreak_full_{to_slug(tiebreaker_model)}"
-        tiebreaker_full_grade_dir = panel_dir / "grades" / tiebreak_full_grade_id
-        if args.resume and tiebreaker_full_grade_dir.exists():
-            shutil.rmtree(tiebreaker_full_grade_dir)
-        tiebreak_meta = {
-            "phase": "grade",
-            "grade_id": tiebreak_full_grade_id,
-            "timestamp_utc": utc_now_iso(),
-            "responses_file": str(responses_file.resolve()),
-            "response_record_count": len(source_rows),
-            "judge_model": tiebreaker_model,
-            "judge_system_prompt": args.judge_system_prompt,
-            "judge_user_template_file": args.judge_user_template_file or None,
-            "judge_response_format": pick_judge_response_format(tiebreaker_model),
-            "parallelism": 0,
-            "judge_temperature": args.judge_temperature,
-            "judge_max_tokens": args.judge_max_tokens,
-            "store_judge_response_raw": bool(args.store_judge_response_raw),
-            "judge_reasoning_effort": args.judge_reasoning_effort,
-            "retries": args.retries,
-            "timeout_seconds": args.timeout_seconds,
-            "dry_run": bool(args.dry_run),
-            "judge_no_hint": bool(args.judge_no_hint),
-            "fail_on_error": bool(args.fail_on_error),
-            "config_path": str(pathlib.Path(args.config).resolve()),
-            "synthetic_tiebreaker_full": True,
-            "source_primary_grade_dirs": [str(p.resolve()) for p in primary_grade_dirs],
-            "source_tiebreak_subset_grade_dir": str(tiebreak_subset_grade_dir.resolve())
-            if tiebreak_subset_grade_dir
-            else None,
-            "disagreement_count": len(disagreement_rows),
-        }
-        _write_tiebreak_full_grade_artifacts(
-            grade_dir=tiebreaker_full_grade_dir,
-            grade_meta=tiebreak_meta,
-            grade_rows=tiebreak_full_grade_rows,
-        )
-        grade_dirs_for_aggregate.append(tiebreaker_full_grade_dir)
+    aggregate_consensus_method = "mean"
 
-    aggregate_consensus_method = "primary_tiebreak" if tiebreaker_model else "mean"
     aggregate_id = f"{panel_id}__aggregate"
     aggregate_dir_path = panel_dir / "aggregates" / aggregate_id
     if args.resume and aggregate_dir_path.exists():
@@ -3329,14 +4155,26 @@ def run_grade_panel(args: argparse.Namespace) -> int:
         "timestamp_utc": timestamp.isoformat(),
         "panel_dir": str(panel_dir.resolve()),
         "responses_file": str(responses_file.resolve()),
+        "panel_mode": panel_mode,
+        "judge_models": [
+            str(load_grade_dir(str(path)).get("judge_model", "")) for path in grade_dirs_for_aggregate
+        ],
+        "judge_count": len(grade_dirs_for_aggregate),
         "primary_judges": primary_judges,
-        "tiebreaker_model": tiebreaker_model or None,
+        "tiebreaker_model": None,
         "parallel_primary_judges": bool(args.parallel_primary_judges),
         "resumed": bool(args.resume),
         "parallelism": int(args.parallelism),
         "primary_judges_max_inflight": int(args.parallelism)
-        * (len(primary_judges) if args.parallel_primary_judges else 1),
+        * (
+            (len(grade_dirs_for_aggregate) if panel_mode == "full" else len(primary_judges))
+            if args.parallel_primary_judges
+            else 1
+        ),
         "primary_grade_dirs": [str(path.resolve()) for path in primary_grade_dirs],
+        "grade_dirs_for_aggregate": [
+            str(path.resolve()) for path in grade_dirs_for_aggregate
+        ],
         "tiebreaker_grade_dir": str(tiebreaker_full_grade_dir.resolve())
         if tiebreaker_full_grade_dir
         else None,

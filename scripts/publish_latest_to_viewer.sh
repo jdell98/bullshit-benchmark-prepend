@@ -178,74 +178,104 @@ data = scrub(data)
 path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 PY
 
-python3 - <<'PY' "${OUTPUT_DIR}/aggregate.jsonl"
+python3 - <<'PY' "${OUTPUT_DIR}/responses.jsonl" "${OUTPUT_DIR}/aggregate.jsonl"
 import json
 import pathlib
+import re
 import sys
 
-path = pathlib.Path(sys.argv[1])
-text = path.read_text(encoding="utf-8")
+PATH_PATTERN = re.compile(r"/Users/[^\s\"|]+")
 
-rows = []
-buf = []
-depth = 0
-in_string = False
-escape = False
+def sanitize_string(value: str) -> str:
+    return PATH_PATTERN.sub("[local-path]", value)
 
-for ch in text:
-    if depth == 0:
-        if ch.isspace():
-            continue
-        if ch != "{":
-            continue
-        buf = ["{"]
-        depth = 1
-        in_string = False
-        escape = False
-        continue
+def sanitize_value(value):
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            key_text = str(key)
+            if key_text.endswith("_grade_dir"):
+                continue
+            out[key] = sanitize_value(item)
+        return out
+    if isinstance(value, list):
+        return [sanitize_value(item) for item in value]
+    if isinstance(value, str):
+        return sanitize_string(value)
+    return value
 
-    if in_string:
-        if escape:
-            buf.append(ch)
+def normalize_row(row: dict):
+    status = str(row.get("status", "")).strip().lower()
+    if not status:
+        row["status"] = "error" if str(row.get("error", "")).strip() else "ok"
+    return row
+
+def parse_json_objects(text: str):
+    rows = []
+    buf = []
+    depth = 0
+    in_string = False
+    escape = False
+
+    for ch in text:
+        if depth == 0:
+            if ch.isspace():
+                continue
+            if ch != "{":
+                continue
+            buf = ["{"]
+            depth = 1
+            in_string = False
             escape = False
             continue
-        if ch == "\\":
+
+        if in_string:
+            if escape:
+                buf.append(ch)
+                escape = False
+                continue
+            if ch == "\\":
+                buf.append(ch)
+                escape = True
+                continue
+            if ch == '"':
+                buf.append(ch)
+                in_string = False
+                continue
+            if ch == "\n":
+                buf.append("\\n")
+                continue
+            if ch == "\r":
+                buf.append("\\r")
+                continue
             buf.append(ch)
-            escape = True
             continue
+
         if ch == '"':
             buf.append(ch)
-            in_string = False
-            continue
-        if ch == "\n":
-            buf.append("\\n")
-            continue
-        if ch == "\r":
-            buf.append("\\r")
-            continue
-        buf.append(ch)
-        continue
+            in_string = True
+        elif ch == "{":
+            buf.append(ch)
+            depth += 1
+        elif ch == "}":
+            buf.append(ch)
+            depth -= 1
+            if depth == 0:
+                rows.append(json.loads("".join(buf)))
+                buf = []
+        else:
+            buf.append(ch)
+    return rows
 
-    buf.append(ch)
-    if ch == '"':
-        in_string = True
-    elif ch == "{":
-        depth += 1
-    elif ch == "}":
-        depth -= 1
-        if depth == 0:
-            rows.append(json.loads("".join(buf)))
-            buf = []
+for target in sys.argv[1:]:
+    path = pathlib.Path(target)
+    text = path.read_text(encoding="utf-8")
+    rows = [normalize_row(sanitize_value(row)) for row in parse_json_objects(text)]
+    path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n" for row in rows),
+        encoding="utf-8",
+    )
 
-for row in rows:
-    for key in list(row.keys()):
-        if key.endswith("_grade_dir"):
-            row.pop(key, None)
-
-path.write_text(
-    "".join(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n" for row in rows),
-    encoding="utf-8",
-)
 PY
 
 generated_at_utc="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
