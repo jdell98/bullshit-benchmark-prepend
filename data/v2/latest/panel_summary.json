@@ -1,6 +1,6 @@
 {
   "panel_id": "run_v2_latest146_claude_only_20260301_015128_panel",
-  "timestamp_utc": "2026-03-05T22:12:35.804495+00:00",
+  "timestamp_utc": "2026-03-07T14:35:52.602162+00:00",
   "panel_mode": "full",
   "judge_models": [
     "anthropic/claude-sonnet-4.6",
@@ -18,7 +18,7 @@
   "primary_judges_max_inflight": 36,
   "grade_dirs_for_aggregate": [],
   "disagreement_count": 1425,
-  "disagreement_rate": 0.1851,
+  "disagreement_rate": 0.0944,
   "consensus_method": "mean",
   "fail_on_error": false,
   "publish_mode": "supplemental",
@@ -26,8 +26,9 @@
     "run_v2_latest146_claude_only_20260301_015128_panel",
     "run_v2_gpt52chat_20260302_1622_panel",
     "run_v2_gpt53chat_gemini31flashlite_20260303_225638_panel",
-    "run_v2_gpt54_openrouter_20260305_panel"
+    "run_v2_gpt54_openrouter_20260305_panel",
+    "run_20260307_014755_panel"
   ],
   "execution_mode": "supplemental_merge",
-  "notes": "Supplemental publish appended panel run_v2_gpt52chat_20260302_1622_panel. Supplemental publish appended panel run_v2_gpt53chat_gemini31flashlite_20260303_225638_panel. Supplemental publish appended panel run_v2_gpt54_openrouter_20260305_panel."
+  "notes": "Supplemental publish appended panel run_v2_gpt52chat_20260302_1622_panel. Supplemental publish appended panel run_v2_gpt53chat_gemini31flashlite_20260303_225638_panel. Supplemental publish appended panel run_v2_gpt54_openrouter_20260305_panel. Supplemental publish appended panel run_20260307_014755_panel."
 }

@@ -103,13 +103,32 @@ Provider routing is configured per model via `collect.model_providers` and
 ./scripts/run_end_to_end.sh --config config.v2.json --viewer-output-dir data/v2/latest --with-additional-judges
 ```
 
-4. Optionally run the default config end-to-end (publishes to `data/latest`):
+4. Optionally prepend a sentence before every question sent to the model:
+
+```bash
+# Via CLI argument (passed through to the collect phase):
+python3 scripts/openrouter_benchmark.py collect --config config.v2.json \
+  --question-prefix "Think carefully before answering."
+```
+
+Or set it in the config file under `collect`:
+
+```json
+{
+  "collect": {
+    "question_prefix": "Think carefully before answering.",
+    ...
+  }
+}
+```
+
+5. Optionally run the default config end-to-end (publishes to `data/latest`):
 
 ```bash
 ./scripts/run_end_to_end.sh --with-additional-judges
 ```
 
-5. Open the viewer:
+6. Open the viewer:
 
 - Published viewer (latest): https://petergpt.github.io/bullshit-benchmark/viewer/index.v2.html
 - Local viewer (optional):

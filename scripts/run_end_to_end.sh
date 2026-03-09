@@ -23,6 +23,8 @@ Options:
                         After primary judge, run grade-panel for remaining judges
   --skip-collect        Skip collect stage (requires existing responses file)
   --skip-primary-judge  Skip primary judge stage
+  --question-prefix <text>
+                        Text to prepend before each question sent to the model
   --dry-run             Pass --dry-run to collect/grade/grade-panel
   --serve               Start local HTTP server after publish
   --port <port>         HTTP server port for --serve (default: 8877)
@@ -42,6 +44,7 @@ DRY_RUN=0
 SERVE=0
 PORT=8877
 WITH_ADDITIONAL_JUDGES=0
+QUESTION_PREFIX=""
 SKIP_COLLECT=0
 SKIP_PRIMARY_JUDGE=0
 
@@ -74,6 +77,10 @@ while [[ $# -gt 0 ]]; do
     --with-additional-judges)
       WITH_ADDITIONAL_JUDGES=1
       shift
+      ;;
+    --question-prefix)
+      QUESTION_PREFIX="${2:-}"
+      shift 2
       ;;
     --skip-collect)
       SKIP_COLLECT=1
@@ -173,6 +180,9 @@ collect_cmd=(
   --output-dir "${OUTPUT_DIR}"
   --run-id "${RUN_ID}"
 )
+if [[ -n "${QUESTION_PREFIX}" ]]; then
+  collect_cmd+=(--question-prefix "${QUESTION_PREFIX}")
+fi
 if [[ "${DRY_RUN}" -eq 1 ]]; then
   collect_cmd+=(--dry-run)
 fi

@@ -284,6 +284,7 @@ COLLECT_DEFAULTS: dict[str, Any] = {
     "omit_response_system_prompt": False,
     "response_reasoning_effort": "off",
     "model_reasoning_efforts": "",
+    "question_prefix": "",
     "store_request_messages": False,
     "store_response_raw": True,
     "shuffle_tasks": False,
@@ -491,6 +492,11 @@ def parse_args() -> argparse.Namespace:
         help="Max attempts per API call (bounded; default: 3).",
     )
     collect.add_argument("--timeout-seconds", type=int, default=120)
+    collect.add_argument(
+        "--question-prefix",
+        default="",
+        help="Text to prepend before each question sent to the model.",
+    )
     collect.add_argument(
         "--response-system-prompt",
         default=DEFAULT_RESPONSE_SYSTEM_PROMPT,
@@ -2532,6 +2538,7 @@ def collect_one(
     clients: dict[str, Any] | None,
     system_prompt: str,
     omit_system_prompt: bool,
+    question_prefix: str,
     temperature: float | None,
     max_tokens: int,
     empty_response_retries: int,
@@ -2547,7 +2554,10 @@ def collect_one(
     request_messages: list[dict[str, str]] = []
     if not omit_system_prompt and system_prompt.strip():
         request_messages.append({"role": "system", "content": system_prompt})
-    request_messages.append({"role": "user", "content": question["question"]})
+    user_content = question["question"]
+    if question_prefix:
+        user_content = f"{question_prefix}\n\n{user_content}"
+    request_messages.append({"role": "user", "content": user_content})
 
     reasoning_effort = task.get("response_reasoning_effort")
     effort_value = (
@@ -3040,6 +3050,7 @@ def run_collect(args: argparse.Namespace) -> int:
                         clients=clients,
                         system_prompt=args.response_system_prompt,
                         omit_system_prompt=omit_system_prompt,
+                        question_prefix=str(args.question_prefix).strip(),
                         temperature=args.temperature,
                         max_tokens=args.max_tokens,
                         empty_response_retries=args.empty_response_retries,
